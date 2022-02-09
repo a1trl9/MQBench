@@ -237,11 +237,33 @@ class ONNXQNNPass(object):
             if node.op_type == 'Clip':
                 next_node = self.onnx_model.get_tensor_consumer(node.output[0])[0]
                 assert next_node.op_type in FAKE_QUANTIZE_OP
-                # Input idx2 is zero point.
+                # Input idx1: min; Input idx2: max
+                clip_min = self.onnx_model.get_initializer(node.input[1]).astype(np.float32)
+                clip_max = self.onnx_model.get_initializer(node.input[2]).astype(np.float32)
+                assert clip_max > clip_min
+                # If clip_min is positive and we wanna map it to 0, zp would be negative.
+                # However zp dtype is uint8 (i.e [0, 255]).
+                # Similarily, if clip_max is negative and we wanna map it to 255, zp would be larger
+                # than 255.
+                # In both cases, we give up merging
+                if clip_min > 0 or clip_max < 0:
+                    continue
                 scale = self.onnx_model.get_initializer(next_node.input[1])
-                scale = min(scale, 6.0 / 255)
-                self.onnx_model.set_initializer(next_node.input[1], np.array([scale], dtype=np.float32), raw=False)
-                self.onnx_model.set_initializer(next_node.input[2], np.array([0], dtype=np.uint8), raw=False)
+                zero_point = self.onnx_model.get_initializer(next_node.input[2])
+                should_zp_adjust = (-clip_min / scale).round().astype(np.uint8) < zero_point
+                should_scale_adjust = (clip_max / scale).round().astype(np.uint8) + zero_point < 255
+                if should_zp_adjust is False and should_scale_adjust is False:
+                    self.onnx_model.remove_node_purely(node)
+                    continue
+                if should_zp_adjust is True and should_scale_adjust is True:
+                    scale = (clip_max - clip_min) / 255.0
+                    zero_point = (-clip_min / scale).round().astype(np.uint8)
+                elif should_scale_adjust is True:
+                    scale = clip_max / (255 - zero_point).astype(np.float32)
+                else:
+                    zero_point = -clip_min.round().astype(np.uint8)
+                self.onnx_model.set_initializer(next_node.input[1], scale, raw=False)
+                self.onnx_model.set_initializer(next_node.input[2], zero_point, raw=False)
                 self.onnx_model.remove_node_purely(node)
                 next_node.input[0] = node.input[0]
         self.onnx_model.topologize_graph()
@@ -257,7 +279,6 @@ class ONNXQNNPass(object):
                 if scale_proto.raw_data != b'' and scale_proto.dims[0] == 1:
                     scale_data = self.onnx_model.get_initializer(scale)
                     self.onnx_model.set_initializer(scale, scale_data.astype(np.float32), raw=False)
-                zero_point_proto = self.onnx_model.initializer[zero_point][0]
                 zero_point_data = self.onnx_model.get_initializer(zero_point)
                 # Align sym and asym scheme.
                 zero_point_data = (zero_point_data - qmin).reshape((1,))
